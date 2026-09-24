@@ -506,6 +506,153 @@ def _start_offset(ring, reference_ring):
     return best[1]
 
 
+# A non-zero cyclic phase is accepted only when it is substantially better than
+# both the contour's current phase and every other possible rotation.  The
+# margin is deliberately generous: a nearly symmetric contour does not contain
+# enough geometric evidence to overrule the donor's existing correspondence.
+CYCLIC_PHASE_IMPROVEMENT_RATIO = 0.70
+CYCLIC_PHASE_AMBIGUITY_RATIO = 0.85
+
+
+def _normalised_contour_points(contour):
+    """All real points in ``contour``, normalised to its own on-curve box.
+
+    Controls participate in the comparison.  This distinguishes repeated or
+    similar curve runs whose on-curve nodes alone can make two cyclic phases
+    look equally plausible.  The box comes from on-curve nodes so an overshoot
+    or long handle cannot redefine the coordinate system it is being judged in.
+    """
+    nodes = _contour_node_points(contour)
+    if nodes is None or not nodes:
+        return None
+    xs = [point[0] for point in nodes]
+    ys = [point[1] for point in nodes]
+    x_min, y_min = min(xs), min(ys)
+    width = (max(xs) - x_min) or 1.0
+    height = (max(ys) - y_min) or 1.0
+    points = []
+    for _op, args in contour:
+        for point in args:
+            if point is None:
+                return None
+            points.append(((point[0] - x_min) / width, (point[1] - y_min) / height))
+    return points
+
+
+def _cyclic_phase_cost(contour, reference):
+    """Squared normalised point travel for two structurally equal contours."""
+    here = _normalised_contour_points(contour)
+    there = _normalised_contour_points(reference)
+    if here is None or there is None or len(here) != len(there):
+        return None
+    return sum(
+        (point[0] - target[0]) ** 2 + (point[1] - target[1]) ** 2
+        for point, target in zip(here, there, strict=True)
+    )
+
+
+def _confident_cyclic_phase(contour, reference):
+    """Return a clearly better exact rotation, otherwise the original contour."""
+    taken = _contour_nodes(contour)
+    if taken is None or not _is_closed(contour, taken):
+        return contour
+    count = len(taken[1])
+    if count < 3:
+        return contour
+
+    reference_shape = tuple((op, len(points)) for op, points in reference)
+    candidates = []
+    for shift in range(count):
+        rotated = _rotate_contour(contour, shift)
+        if rotated is None:
+            continue
+        if tuple((op, len(points)) for op, points in rotated) != reference_shape:
+            continue
+        cost = _cyclic_phase_cost(rotated, reference)
+        if cost is not None:
+            candidates.append((cost, shift, rotated))
+    if not candidates:
+        return contour
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    best_cost, best_shift, best = candidates[0]
+    current = next((item for item in candidates if item[1] == 0), None)
+    if current is None or best_shift == 0:
+        return contour
+    current_cost = current[0]
+    if current_cost <= 1e-12 or best_cost >= current_cost * CYCLIC_PHASE_IMPROVEMENT_RATIO:
+        return contour
+    if len(candidates) > 1:
+        second_cost = candidates[1][0]
+        if second_cost <= 1e-12 or best_cost >= second_cost * CYCLIC_PHASE_AMBIGUITY_RATIO:
+            return contour
+    return best
+
+
+def _repair_cyclic_phase_correspondence(outlines, reference_pos, donor_outlines=None):
+    """Repair confidently wrong cyclic phases without changing any drawing.
+
+    The reference master is kept fixed.  Each side is then compared outward to
+    its already-corresponded adjacent master, which follows gradual design
+    changes more reliably than comparing every extreme directly to the middle.
+    Only start points / segment order rotate; no point coordinates move.
+
+    Donor contour-count changes are intentionally out of scope.  A 2-to-3
+    contour transition needs topology reconstruction, not a cyclic phase guess,
+    and is left to the existing paths unchanged.
+    """
+    if outlines is None or not outlines or not _already_compatible(outlines):
+        return outlines
+    positions = sorted(outlines)
+    reference = reference_pos if reference_pos in outlines else positions[len(positions) // 2]
+    if (
+        donor_outlines is not None
+        and len({len(contours) for contours in donor_outlines.values()}) != 1
+    ):
+        return outlines
+    if len({len(contours) for contours in outlines.values()}) != 1:
+        return outlines
+
+    repaired = {position: list(contours) for position, contours in outlines.items()}
+    reference_index = positions.index(reference)
+    changed = False
+    for contour_index in range(len(outlines[reference])):
+        anchor = repaired[reference][contour_index]
+        for position in positions[reference_index + 1 :]:
+            contour = repaired[position][contour_index]
+            candidate = _confident_cyclic_phase(contour, anchor)
+            if candidate is not contour:
+                repaired[position][contour_index] = candidate
+                changed = True
+            anchor = repaired[position][contour_index]
+
+        anchor = repaired[reference][contour_index]
+        for position in reversed(positions[:reference_index]):
+            contour = repaired[position][contour_index]
+            candidate = _confident_cyclic_phase(contour, anchor)
+            if candidate is not contour:
+                repaired[position][contour_index] = candidate
+                changed = True
+            anchor = repaired[position][contour_index]
+
+    if not changed:
+        return outlines
+    # The proposal is exact at every master, but its path between masters is
+    # new.  Reject it wholesale if any established geometry gate becomes unsafe
+    # rather than freezing the glyph or partially applying an uncertain repair.
+    if (
+        not _already_compatible(repaired)
+        or not _struct_ok(repaired)
+        or not _cu2qu_safe(repaired)
+        or not _interp_ok(repaired)
+        or not _interp_smooth(repaired)
+        or _disjoint_cross(repaired)
+        or _has_interpolated_self_intersection(repaired)
+    ):
+        return outlines
+    return repaired
+
+
 def _align_starts(outlines, reference_pos):
     """Rotate each contour so every master writes it from the same node.
 
@@ -1234,6 +1381,14 @@ def reconstruct(outlines_by_pos, reference_pos=400, *, _fold_retry=True):
     separate bar stubs merge into the body at heavy weights)."""
     global RESAMPLE_STEP
     out, info = _reconstruct_base(outlines_by_pos, reference_pos)
+    if out is not None:
+        phased = _repair_cyclic_phase_correspondence(out, reference_pos, outlines_by_pos)
+        if phased is not out:
+            out = phased
+            info = {
+                **info,
+                "note": "+".join(filter(None, (info.get("note"), "cyclic-phase"))),
+            }
     out, info = _ink_tournament(out, info, outlines_by_pos, reference_pos)
     if out is None:
         floating = _reconstruct_floating_contour(outlines_by_pos, reference_pos)
