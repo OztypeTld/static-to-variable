@@ -39,6 +39,7 @@ from variable_gen.common import PipelineError
 from variable_gen.curve_certificate import certify_curve_distance
 from variable_gen.quadratic_reference_templates import (
     REFERENCE_TEMPLATE,
+    REFERENCE_TEMPLATES_KEY,
     load_reference_templates,
 )
 from variable_gen.quadratic_semantic_partition import (
@@ -147,6 +148,9 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
     version_four_keys = version_three_keys | {"splitFraction"}
     version_five_keys = version_two_keys | {"semanticContour"}
     version_six_keys = version_three_keys | {"endpointSpanStarts"}
+    # Version 7 binds a seam to each named endpoint-span operation: the
+    # authored parameter at which native capacity meets the extra capacity.
+    version_seven_keys = version_six_keys | {"endpointSplitFractions"}
     result = {}
     for name in sorted(names):
         values = []
@@ -166,6 +170,7 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
                 frozenset(version_four_keys),
                 frozenset(version_five_keys),
                 frozenset(version_six_keys),
+                frozenset(version_seven_keys),
             }
             for value in values
         ):
@@ -183,6 +188,7 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
         match_axes = recipe.get("protectedMatchAxes", [])
         endpoint_spans = recipe.get("endpointSpans", {})
         endpoint_starts = recipe.get("endpointSpanStarts", [])
+        split_fractions = recipe.get("endpointSplitFractions", {})
         semantic_contour = recipe.get("semanticContour", 0)
         valid_endpoints = (
             isinstance(endpoint_spans, dict)
@@ -216,7 +222,7 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
         valid = (
             placements.get(name) == SEMANTIC_PARTITION
             and type(version) is int
-            and version in {1, 2, 3, 4, 5, 6}
+            and version in {1, 2, 3, 4, 5, 6, 7}
             and (
                 (version == 1 and set(recipe) == version_one_keys)
                 or (version == 2 and set(recipe) == version_two_keys)
@@ -224,6 +230,7 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
                 or (version == 4 and set(recipe) == version_four_keys)
                 or (version == 5 and set(recipe) == version_five_keys)
                 or (version == 6 and set(recipe) == version_six_keys)
+                or (version == 7 and set(recipe) == version_seven_keys)
             )
             and recipe["placement"] == SEMANTIC_PARTITION
             and recipe["glyph"] == name
@@ -249,7 +256,29 @@ def _semantic_partition_metadata(fonts, placements: dict[str, str]) -> dict[str,
             )
             and len(set(weights)) == len(weights)
             and (version not in {2, 5} or (valid_pairs and bool(pairs and match_axes)))
-            and (version not in {3, 4, 6} or valid_endpoints)
+            and (version not in {3, 4, 6, 7} or valid_endpoints)
+            and (
+                version != 7
+                or (
+                    isinstance(endpoint_starts, (list, tuple))
+                    and all(type(index) is int and index >= 0 for index in endpoint_starts)
+                    and len(set(endpoint_starts)) == len(endpoint_starts)
+                    and set(endpoint_starts) <= {int(key) for key in endpoint_spans}
+                    and isinstance(split_fractions, dict)
+                    and bool(split_fractions)
+                    and all(
+                        isinstance(key, str)
+                        and key.isdecimal()
+                        and str(int(key)) == key
+                        and key in endpoint_spans
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        and 0 < value < 1
+                        for key, value in split_fractions.items()
+                    )
+                )
+            )
             and (
                 version != 6
                 or (
@@ -317,7 +346,8 @@ def _adaptive_piecewise_metadata(fonts, placements: dict[str, str]) -> dict[str,
         allocations = recipe.get("allocations") if isinstance(recipe, dict) else None
         valid = (
             isinstance(recipe, dict)
-            and required <= set(recipe) <= required | {"carrierScale"}
+            and required <= set(recipe) <= required | {"carrierScale", "fitMode"}
+            and recipe.get("fitMode", "piecewise") in ("piecewise", "continuous")
             and type(recipe.get("carrierScale", 16)) is int
             and recipe.get("carrierScale", 16) in (16, 32, 64)
             and placements.get(name) == ADAPTIVE_PIECEWISE
@@ -329,7 +359,7 @@ def _adaptive_piecewise_metadata(fonts, placements: dict[str, str]) -> dict[str,
             and len(recipe["glyphRowsSha256"]) == 64
             and all(character in "0123456789abcdef" for character in recipe["glyphRowsSha256"])
             and type(recipe["subdivisions"]) is int
-            and recipe["subdivisions"] == CONTINUOUS_CHAIN_SUBDIVISIONS
+            and recipe["subdivisions"] in (4, 8)
             and isinstance(allocations, dict)
             and all(
                 isinstance(key, str)
@@ -399,13 +429,13 @@ def _native_iup_transport_metadata(fonts, placements: dict[str, str]) -> dict[st
 
             validate_endpoint_transport(name, recipe)
             if placements.get(name) != SEMANTIC_PARTITION or any(
-                font[name].lib.get(SEMANTIC_PARTITION_KEY, {}).get("schemaVersion") not in (3, 6)
+                font[name].lib.get(SEMANTIC_PARTITION_KEY, {}).get("schemaVersion") not in (3, 6, 7)
                 or font[name].lib[SEMANTIC_PARTITION_KEY].get("glyphRowsSha256")
                 != recipe["glyphRowsSha256"]
                 for font in fonts
             ):
                 raise PipelineError(
-                    f"{name}: endpoint transport requires matching semantic v3 or v6 metadata"
+                    f"{name}: endpoint transport requires matching semantic v3, v6 or v7 metadata"
                 )
             result[name] = recipe
             continue
@@ -1018,6 +1048,7 @@ def fit_adaptive_piecewise_group(
     allocations: tuple[int, ...],
     tolerance: float,
     glyph_name: str,
+    fit_mode: str = "piecewise",
 ) -> list[list[Operation]]:
     """Fit reviewed cubic pieces to one fixed, native-derived q allocation.
 
@@ -1026,16 +1057,31 @@ def fit_adaptive_piecewise_group(
     The latter preserves each authored join and gives difficult pieces only the
     native subdivision capacity assigned to them. Acceptance uses the symmetric
     geometric certificate over the complete group.
+
+    An explicit continuous fit uses arc-length correspondence across the group
+    while retaining its fixed allocation and the same geometric certificate.
+    It may approximate authored joins within the declared conversion bound;
+    protected native operations are still partitioned analytically.
     """
     if not groups:
         raise ValueError("Adaptive piecewise conversion requires source groups")
+    if fit_mode not in ("piecewise", "continuous"):
+        raise ValueError("Unknown adaptive piecewise fit mode")
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("Adaptive piecewise conversion requires a finite tolerance")
     if not allocations or any(type(count) is not int or count < 1 for count in allocations):
         raise ValueError("Adaptive piecewise allocations must be positive integers")
     fitted: list[list[Operation]] = []
     for group in groups:
-        if len(group) == 1:
+        if fit_mode == "continuous":
+            spline = _continuous_piecewise_spline(group, sum(allocations), tolerance)
+            if spline is None:
+                raise PipelineError(
+                    f"{glyph_name}: continuous adaptive fit exceeds {tolerance:g}-unit bound"
+                )
+            operations = _partition_spline_by_counts(spline, allocations)
+            spans = _quadratic_spans(spline)
+        elif len(group) == 1:
             spline = _reference_count_spline(group[0], sum(allocations), tolerance)
             if spline is None:
                 raise PipelineError(
@@ -1155,8 +1201,12 @@ def _continuous_piecewise_spline(
     return spline if certify_curve_distance(curves, _quadratic_spans(spline), tolerance) else None
 
 
-def _subdivide_reference_chain(start: Point, operation: Operation) -> Operation:
-    """Represent a native quadratic chain exactly with four times its controls."""
+def _subdivide_reference_chain(
+    start: Point, operation: Operation, subdivisions: int = CONTINUOUS_CHAIN_SUBDIVISIONS
+) -> Operation:
+    """Represent a native quadratic chain exactly at the selected dyadic density."""
+    if type(subdivisions) is not int or subdivisions not in (4, 8):
+        raise ValueError("Reference chain subdivision requires four or eight pieces")
     kind, points = operation
     if kind != "qCurveTo":
         raise ValueError("Continuous-chain subdivision requires qCurveTo")
@@ -1173,9 +1223,9 @@ def _subdivide_reference_chain(start: Point, operation: Operation) -> Operation:
                 (control[1] + controls[index + 1][1]) / 2,
             )
         )
-        for part in range(CONTINUOUS_CHAIN_SUBDIVISIONS):
-            value = part / CONTINUOUS_CHAIN_SUBDIVISIONS
-            step = 1 / CONTINUOUS_CHAIN_SUBDIVISIONS
+        for part in range(subdivisions):
+            value = part / subdivisions
+            step = 1 / subdivisions
             inverse = 1 - value
             point = (
                 inverse**2 * span_start[0]
@@ -1222,9 +1272,12 @@ def _subdivide_reference_chain_full(start: Point, operation: Operation) -> list[
 
 
 def _partition_subdivided_reference_chain(
-    start: Point, operation: Operation, allocations: tuple[int, ...]
+    start: Point,
+    operation: Operation,
+    allocations: tuple[int, ...],
+    subdivisions: int = CONTINUOUS_CHAIN_SUBDIVISIONS,
 ) -> list[Operation]:
-    kind, points = _subdivide_reference_chain(start, operation)
+    kind, points = _subdivide_reference_chain(start, operation, subdivisions)
     assert kind == "qCurveTo"
     spline = [start, *[_require_point(point, "reference", "qCurveTo point") for point in points]]
     return _partition_spline_by_counts(spline, allocations)
@@ -1395,6 +1448,17 @@ def _fit_piecewise_group(
     raise PipelineError(f"{glyph_name}: piecewise source exceeds {tolerance:g}-unit cu2qu bound")
 
 
+def _match_stationary_controls(group, spline, operation, start, tolerance):
+    """Keep endpoint velocity zero where the corresponding native span stops."""
+    points = operation[1]
+    result = list(spline)
+    if points[0] == start:
+        result[1] = group[0][0]
+    if points[-2] == points[-1]:
+        result[-2] = group[-1][-1]
+    return result if certify_curve_distance(group, _quadratic_spans(result), tolerance) else spline
+
+
 def _piecewise_contours(
     name: str,
     originals: list[RecordingPen],
@@ -1406,11 +1470,32 @@ def _piecewise_contours(
     semantic_recipe: dict | None = None,
     source_locations: tuple[dict[str, float], ...] = (),
     adaptive_recipe: dict | None = None,
+    template_fit_mode: str = "prefix",
+    template_arc_blend: float = 0,
+    template_stationary_axis: str | None = None,
 ) -> tuple[list[list[list[Operation]]], int, int]:
     """Validate explicit per-master operation groups and stage their conversion."""
     sources = [_contours(recording, name) for recording in originals]
     references = {index: _contours(recording, name) for index, recording in protected.items()}
     reference = references[reference_index]
+    stationary_matches = {}
+    if template_stationary_axis is not None:
+        if len(source_locations) != len(sources) or any(
+            template_stationary_axis not in loc for loc in source_locations
+        ):
+            raise PipelineError(f"{name}: stationary matching requires every source location")
+        for index, location in enumerate(source_locations):
+            if index in references:
+                continue
+            matches = [
+                i
+                for i in references
+                if {k: v for k, v in source_locations[i].items() if k != template_stationary_axis}
+                == {k: v for k, v in location.items() if k != template_stationary_axis}
+            ]
+            if len(matches) != 1:
+                raise PipelineError(f"{name}: stationary matching requires one protected partner")
+            stationary_matches[index] = matches[0]
     if (placement == SEMANTIC_PARTITION) != (semantic_recipe is not None):
         raise PipelineError(f"{name}: semantic partition placement and recipe must agree")
     if (placement == ADAPTIVE_PIECEWISE) != (adaptive_recipe is not None):
@@ -1544,7 +1629,7 @@ def _piecewise_contours(
                 assert adaptive_recipe is not None
                 allocation = adaptive_allocations.get(
                     (contour_index, semantic_index),
-                    (reference_count * CONTINUOUS_CHAIN_SUBDIVISIONS,),
+                    (reference_count * adaptive_recipe["subdivisions"],),
                 )
                 expected = reference_count * adaptive_recipe["subdivisions"]
                 if sum(allocation) != expected:
@@ -1560,7 +1645,13 @@ def _piecewise_contours(
                         f"{name}: adaptive piecewise multi-curve operation "
                         f"{contour_index}:{semantic_index} needs an explicit allocation"
                     )
-                fitted = fit_adaptive_piecewise_group(curves, allocation, tolerance, name)
+                fitted = fit_adaptive_piecewise_group(
+                    curves,
+                    allocation,
+                    tolerance,
+                    name,
+                    adaptive_recipe.get("fitMode", "piecewise"),
+                )
                 expanded += expected - reference_count
                 maximum = max(maximum, max(allocation))
                 for index in range(len(sources)):
@@ -1568,7 +1659,10 @@ def _piecewise_contours(
                         operation = references[index][contour_index][operation_index]
                         result[index][contour_index].extend(
                             _partition_subdivided_reference_chain(
-                                reference_current[index], operation, allocation
+                                reference_current[index],
+                                operation,
+                                allocation,
+                                adaptive_recipe["subdivisions"],
                             )
                         )
                         reference_current[index] = _require_point(
@@ -1585,6 +1679,12 @@ def _piecewise_contours(
                 if extra_spans is not None:
                     leading = semantic_index in semantic_recipe["semanticSlots"]
                     at_start = semantic_index in semantic_recipe.get("endpointSpanStarts", [])
+                    # The seam is an authored parameter in contour order. Native
+                    # capacity lies before it at an end span and after it at a
+                    # start span; the collapsed protected capacity is unchanged.
+                    split_fraction = semantic_recipe.get("endpointSplitFractions", {}).get(
+                        str(semantic_index), semantic_recipe.get("splitFraction", 0.5)
+                    )
                     target_start = reference_current[reference_index]
                     for index, group in enumerate(curves):
                         if index in references:
@@ -1621,6 +1721,7 @@ def _piecewise_contours(
                                         tolerance,
                                         extra_spans=extra_spans,
                                         protected_start=target_start,
+                                        split_fraction=split_fraction,
                                     )
                                     if at_start
                                     else partition_endpoint_spans(
@@ -1629,7 +1730,7 @@ def _piecewise_contours(
                                         _reference_count_spline,
                                         tolerance,
                                         extra_spans=extra_spans,
-                                        split_fraction=semantic_recipe.get("splitFraction", 0.5),
+                                        split_fraction=split_fraction,
                                         leading_start=leading_start,
                                         protected_start=target_start if leading else None,
                                     )
@@ -1917,6 +2018,53 @@ def _piecewise_contours(
                         else:
                             result[index][contour_index].append(("qCurveTo", tuple(spline[1:])))
                 continue
+            if placement == REFERENCE_TEMPLATE and template_fit_mode == "direct":
+                stationary_starts = dict(reference_current)
+                for index, group in enumerate(curves):
+                    if index in references:
+                        operation = references[index][contour_index][operation_index]
+                        result[index][contour_index].append(operation)
+                        reference_current[index] = _require_point(
+                            operation[1][-1], name, "reference endpoint"
+                        )
+                        continue
+                    spline = (
+                        _reference_count_spline(group[0], reference_count, tolerance)
+                        if len(group) == 1
+                        else _continuous_piecewise_spline(group, reference_count, tolerance)
+                    )
+                    if spline is not None and len(group) == 1 and template_arc_blend:
+                        arc = _continuous_piecewise_spline(group, reference_count, tolerance)
+                        if arc is not None:
+                            spline = [
+                                (
+                                    (1 - template_arc_blend) * a[0] + template_arc_blend * b[0],
+                                    (1 - template_arc_blend) * a[1] + template_arc_blend * b[1],
+                                )
+                                for a, b in zip(spline, arc, strict=True)
+                            ]
+                            if not certify_curve_distance(
+                                group, _quadratic_spans(spline), tolerance
+                            ):
+                                raise PipelineError(
+                                    f"{name}: blended template fit exceeds {tolerance:g}-unit bound"
+                                )
+                    if spline is None:
+                        raise PipelineError(
+                            f"{name}: direct template fit exceeds {tolerance:g}-unit bound"
+                        )
+                    if index in stationary_matches:
+                        partner = stationary_matches[index]
+                        spline = _match_stationary_controls(
+                            group,
+                            spline,
+                            references[partner][contour_index][operation_index],
+                            stationary_starts[partner],
+                            tolerance,
+                        )
+                    result[index][contour_index].append(("qCurveTo", tuple(spline[1:])))
+                maximum = max(maximum, reference_count)
+                continue
             effective_placement = (
                 REFERENCE_COUNT
                 if placement
@@ -2202,6 +2350,7 @@ def preserve_quadratic_reference(
     protected_locations: dict[int, dict[str, float]] | None = None,
     glyph_max_error: dict[str, float] | None = None,
     source_groups: dict[str, SourceGroups] | None = None,
+    source_axis_names: dict[str, str] | None = None,
 ) -> QuadraticReferenceReport:
     """Convert ``fonts`` in place while preserving a protected TT default.
 
@@ -2318,6 +2467,11 @@ def preserve_quadratic_reference(
         }
         if len(signatures) != 1:
             raise PipelineError(f"{name}: protected reference masters have incompatible topology")
+
+    def stationary_source_axis(name):
+        tag = fonts[0][name].lib.get(REFERENCE_TEMPLATES_KEY, {}).get("stationaryAxis")
+        return (source_axis_names or {}).get(tag, tag) if tag is not None else None
+
     staged_groups = {
         name: _piecewise_contours(
             name,
@@ -2330,6 +2484,9 @@ def preserve_quadratic_reference(
             semantic_recipes.get(name),
             source_locations,
             adaptive_recipes.get(name),
+            fonts[0][name].lib.get(REFERENCE_TEMPLATES_KEY, {}).get("fitMode", "prefix"),
+            fonts[0][name].lib.get(REFERENCE_TEMPLATES_KEY, {}).get("arcBlend", 0),
+            stationary_source_axis(name),
         )
         for name, groups in source_groups.items()
     }
@@ -2340,7 +2497,10 @@ def preserve_quadratic_reference(
             contours,
             protected_indices if name not in endpoint_transports else frozenset(),
             placements[name],
-            adaptive_recipes.get(name, {}).get("carrierScale", 16),
+            adaptive_recipes.get(name, {}).get(
+                "carrierScale",
+                fonts[0][name].lib.get(REFERENCE_TEMPLATES_KEY, {}).get("carrierScale", 16),
+            ),
         )
         for name, (contours, _, _) in staged_groups.items()
         if placements.get(name)
