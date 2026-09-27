@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     split_parser.add_argument("--json", action="store_true", help="emit a JSON summary")
 
+    ital_merge_parser = subparsers.add_parser(
+        "ital-merge",
+        help="Merge configured Roman and Italic variable styles behind an ital axis.",
+    )
+    ital_merge_parser.add_argument("--config", required=True, help="path to stv.config.json")
+
     for name, help_text in _PIPELINE_COMMANDS.items():
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument("--config", required=True, help="path to stv.config.json")
@@ -71,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
             return _pipeline_status(args)
         if args.command == "split":
             return _split(args)
+        if args.command == "ital-merge":
+            return _ital_merge(args)
         if args.command in _PIPELINE_COMMANDS:
             return _pipeline_command(args)
     except (ConfigError, ValueError) as exc:
@@ -89,6 +97,19 @@ def run_command(command: str, argv: list[str] | None = None) -> int:
     single implementation."""
     args = sys.argv[1:] if argv is None else argv
     return main([command, *args])
+
+
+def _ital_merge(args: argparse.Namespace) -> int:
+    from .ital_merge import merge_ital
+
+    config = load_config(args.config)
+    report = merge_ital(config)
+    print(f"ital merge -> {report.output}")
+    print(
+        f"interpolated={len(report.interpolated)} "
+        f"substituted={len(report.substituted)} review={len(report.review)}"
+    )
+    return 0
 
 
 def _pipeline_command(args: argparse.Namespace) -> int:

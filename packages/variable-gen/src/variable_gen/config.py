@@ -114,10 +114,31 @@ class GlyphStrategy:
 
 
 @dataclass(frozen=True)
+class ItalGlyphStrategy:
+    strategy: str
+    threshold: float | None = None
+
+
+@dataclass(frozen=True)
 class GlyphConfig:
     freeze: tuple[str, ...] = ()
     strategies: dict[str, GlyphStrategy] = field(default_factory=dict)
     seeds: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    ital_default_strategy: str = "auto"
+    ital_strategies: dict[str, ItalGlyphStrategy] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ItalMergeConfig:
+    roman_style: str
+    italic_style: str
+    axis: ConfigAxis
+    strategy: str = "hybrid"
+    glyph_set: str = "union"
+    endpoint_fidelity: str = "exact"
+    layout_threshold: float = 0.5
+    output: Path | None = None
+    config_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,11 +180,19 @@ class ProjectConfig:
     vertical_metrics: VerticalMetrics | None
     discovery: Discovery | None
     glyphs: GlyphConfig
+    ital_merge: ItalMergeConfig | None
     normalize: dict[str, bool]
     raw: dict[str, Any]
 
 
 _VALID_STRATEGIES = {"open_bar", "freeze", "interpolate_neighbors"}
+_VALID_ITAL_STRATEGIES = {
+    "auto",
+    "interpolate",
+    "cyclic_interpolate",
+    "substitute",
+    "review",
+}
 
 
 def resolve_style_keys(config: ProjectConfig, style: str) -> list[str]:
@@ -221,6 +250,7 @@ def load_config(path: str | Path) -> ProjectConfig:
     vertical_metrics = _parse_vertical_metrics(raw.get("verticalMetrics"), config_path)
     discovery = _parse_discovery(raw.get("discovery"), config_path)
     glyphs = _parse_glyphs(raw.get("glyphs"), config_path)
+    ital_merge = _parse_ital_merge(raw.get("italMerge"), repo_root, styles, config_path)
     normalize = _parse_normalize(raw.get("normalize"), config_path)
 
     return ProjectConfig(
@@ -235,6 +265,7 @@ def load_config(path: str | Path) -> ProjectConfig:
         vertical_metrics=vertical_metrics,
         discovery=discovery,
         glyphs=glyphs,
+        ital_merge=ital_merge,
         normalize=normalize,
         raw=raw,
     )
@@ -741,7 +772,101 @@ def _parse_glyphs(raw: Any, config_path: Path) -> GlyphConfig:
             _glyph_name(name, f"glyphs.seeds[{style_key!r}]", config_path) for name in names
         )
 
-    return GlyphConfig(freeze=freeze, strategies=strategies, seeds=seeds)
+    ital_default_strategy = raw.get("italDefaultStrategy", "auto")
+    if ital_default_strategy not in _VALID_ITAL_STRATEGIES:
+        raise ConfigError(
+            f"{config_path}: glyphs.italDefaultStrategy {ital_default_strategy!r} "
+            f"is not one of {sorted(_VALID_ITAL_STRATEGIES)}"
+        )
+    ital_raw = raw.get("italStrategies", {})
+    if not isinstance(ital_raw, dict):
+        raise ConfigError(f"{config_path}: glyphs.italStrategies must be an object")
+    ital_strategies: dict[str, ItalGlyphStrategy] = {}
+    for name, payload in ital_raw.items():
+        if not isinstance(payload, dict):
+            raise ConfigError(f"{config_path}: glyphs.italStrategies[{name!r}] must be an object")
+        strategy = _required_str(payload, "strategy", config_path)
+        if strategy not in _VALID_ITAL_STRATEGIES:
+            raise ConfigError(
+                f"{config_path}: glyphs.italStrategies[{name!r}].strategy "
+                f"{strategy!r} is not one of {sorted(_VALID_ITAL_STRATEGIES)}"
+            )
+        threshold = None
+        if "threshold" in payload:
+            threshold = _coerce_number(
+                payload["threshold"],
+                f"glyphs.italStrategies[{name!r}].threshold",
+                config_path,
+            )
+            if not 0 <= threshold <= 1:
+                raise ConfigError(
+                    f"{config_path}: glyphs.italStrategies[{name!r}].threshold "
+                    "must be within [0, 1]"
+                )
+        ital_strategies[_glyph_name(name, "glyphs.italStrategies", config_path)] = (
+            ItalGlyphStrategy(strategy=strategy, threshold=threshold)
+        )
+
+    return GlyphConfig(
+        freeze=freeze,
+        strategies=strategies,
+        seeds=seeds,
+        ital_default_strategy=ital_default_strategy,
+        ital_strategies=ital_strategies,
+    )
+
+
+def _parse_ital_merge(
+    raw: Any,
+    repo_root: Path,
+    styles: dict[str, Style],
+    config_path: Path,
+) -> ItalMergeConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{config_path}: italMerge must be an object")
+
+    roman_style = _required_str(raw, "romanStyle", config_path)
+    italic_style = _required_str(raw, "italicStyle", config_path)
+    if roman_style == italic_style:
+        raise ConfigError(f"{config_path}: italMerge styles must be different")
+    for key in (roman_style, italic_style):
+        if key not in styles:
+            raise ConfigError(f"{config_path}: italMerge references unknown style {key!r}")
+
+    axis = _parse_axis(_required_dict(raw, "axis", config_path), config_path)
+    if axis.tag != "ital" or (axis.minimum, axis.default, axis.maximum) != (0.0, 0.0, 1.0):
+        raise ConfigError(
+            f"{config_path}: italMerge axis must be registered ital 0..1 with default 0"
+        )
+    strategy = raw.get("strategy", "hybrid")
+    if strategy != "hybrid":
+        raise ConfigError(f"{config_path}: italMerge.strategy must be 'hybrid'")
+    glyph_set = raw.get("glyphSet", "union")
+    if glyph_set not in {"union", "intersection"}:
+        raise ConfigError(f"{config_path}: italMerge.glyphSet must be union or intersection")
+    endpoint_fidelity = raw.get("endpointFidelity", "exact")
+    if endpoint_fidelity != "exact":
+        raise ConfigError(f"{config_path}: italMerge.endpointFidelity must be 'exact'")
+
+    layout_threshold = _coerce_number(
+        raw.get("layoutThreshold", 0.5), "italMerge.layoutThreshold", config_path
+    )
+    if not 0 <= layout_threshold <= 1:
+        raise ConfigError(f"{config_path}: italMerge.layoutThreshold must be within [0, 1]")
+    output_value = _optional_str(raw, "output", config_path)
+    return ItalMergeConfig(
+        roman_style=roman_style,
+        italic_style=italic_style,
+        axis=axis,
+        strategy=strategy,
+        glyph_set=glyph_set,
+        endpoint_fidelity=endpoint_fidelity,
+        layout_threshold=layout_threshold,
+        output=_resolve_repo_path(repo_root, output_value) if output_value else None,
+        config_output=output_value,
+    )
 
 
 def _parse_normalize(raw: Any, config_path: Path) -> dict[str, bool]:

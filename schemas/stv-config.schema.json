@@ -44,6 +44,7 @@
     "verticalMetrics": { "$ref": "#/$defs/verticalMetrics" },
     "discovery": { "$ref": "#/$defs/discovery" },
     "glyphs": { "$ref": "#/$defs/glyphs" },
+    "italMerge": { "$ref": "#/$defs/italMerge" },
     "outlineGrid": {
       "type": "number",
       "minimum": 0,
@@ -175,6 +176,26 @@
         "output": { "type": "string", "minLength": 1 }
       }
     },
+    "italMerge": {
+      "type": "object",
+      "required": ["romanStyle", "italicStyle", "axis"],
+      "additionalProperties": false,
+      "properties": {
+        "romanStyle": { "type": "string", "minLength": 1 },
+        "italicStyle": { "type": "string", "minLength": 1 },
+        "axis": { "$ref": "#/$defs/axis" },
+        "strategy": { "const": "hybrid", "default": "hybrid" },
+        "glyphSet": { "enum": ["union", "intersection"], "default": "union" },
+        "endpointFidelity": { "const": "exact", "default": "exact" },
+        "layoutThreshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5
+        },
+        "output": { "type": "string", "minLength": 1 }
+      }
+    },
     "quadraticReference": {
       "type": "object",
       "required": ["path"],
@@ -295,6 +316,41 @@
             "type": "array",
             "items": { "type": "string", "minLength": 1 }
           }
+        },
+        "italDefaultStrategy": {
+          "enum": [
+            "auto",
+            "interpolate",
+            "cyclic_interpolate",
+            "substitute",
+            "review"
+          ],
+          "default": "auto"
+        },
+        "italStrategies": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/italGlyphStrategy" }
+        }
+      }
+    },
+    "italGlyphStrategy": {
+      "type": "object",
+      "required": ["strategy"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "enum": [
+            "auto",
+            "interpolate",
+            "cyclic_interpolate",
+            "substitute",
+            "review"
+          ]
+        },
+        "threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         }
       }
     },

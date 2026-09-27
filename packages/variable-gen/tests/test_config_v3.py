@@ -263,3 +263,80 @@ def test_rejects_invalid_quadratic_reference_error(max_error: object) -> None:
 
     with pytest.raises(ConfigError, match="quadraticReference.maxError"):
         load_config(path)
+
+
+def test_loads_ital_merge_and_glyph_strategies(tmp_path) -> None:
+    raw = _load_raw()
+    raw["italMerge"] = {
+        "romanStyle": "roman",
+        "italicStyle": "italic",
+        "axis": {
+            "tag": "ital",
+            "name": "Italic",
+            "minimum": 0,
+            "default": 0,
+            "maximum": 1,
+        },
+        "strategy": "hybrid",
+        "glyphSet": "union",
+        "endpointFidelity": "exact",
+        "output": "build/merged.ttf",
+    }
+    raw["glyphs"]["italDefaultStrategy"] = "substitute"
+    raw["glyphs"]["italStrategies"] = {
+        "A": {"strategy": "interpolate"},
+        "a": {"strategy": "substitute", "threshold": 0.55},
+        "n.001": {"strategy": "review"},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    config = load_config(config_path)
+
+    assert config.ital_merge is not None
+    assert config.ital_merge.roman_style == "roman"
+    assert config.ital_merge.italic_style == "italic"
+    assert config.ital_merge.axis.tag == "ital"
+    assert config.ital_merge.output == (tmp_path / "build/merged.ttf").resolve()
+    assert config.glyphs.ital_default_strategy == "substitute"
+    assert config.glyphs.ital_strategies["A"].strategy == "interpolate"
+    assert config.glyphs.ital_strategies["a"].threshold == 0.55
+    assert config.glyphs.ital_strategies["n.001"].strategy == "review"
+
+
+@pytest.mark.parametrize(
+    "axis",
+    [
+        {"tag": "ital", "name": "Italic", "minimum": 0, "default": 0.5, "maximum": 1},
+        {"tag": "slnt", "name": "Slant", "minimum": 0, "default": 0, "maximum": 1},
+    ],
+)
+def test_rejects_non_registered_ital_merge_axis(axis, tmp_path) -> None:
+    raw = _load_raw()
+    raw["italMerge"] = {
+        "romanStyle": "roman",
+        "italicStyle": "italic",
+        "axis": axis,
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    with pytest.raises(ConfigError, match="registered ital 0..1"):
+        load_config(config_path)
+
+
+def test_rejects_unknown_ital_merge_style(tmp_path) -> None:
+    raw = _load_raw()
+    raw["italMerge"] = {
+        "romanStyle": "missing",
+        "italicStyle": "italic",
+        "axis": {
+            "tag": "ital",
+            "name": "Italic",
+            "minimum": 0,
+            "default": 0,
+            "maximum": 1,
+        },
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    with pytest.raises(ConfigError, match="unknown style"):
+        load_config(config_path)
